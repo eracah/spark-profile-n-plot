@@ -5,56 +5,27 @@ from operator import add
 from math import sqrt
 #from pyspark import SparkContext
 #sc = SparkContext(appName="ParseEventLog")
-
+from util import *
 import copy
-#TODO: put unbounded fxns in helper functions module
-
-cx_dict = {'treeAggregate at CX.scala:27': 1, 'collect at IndexedRowMatrix.scala:193': 2, 'parquetFile at CX.scala:168': 0, 'count at CX.scala:189': 0,
-   'count at CX.scala:165':0, 'count at CX.scala:166':0 }
-
-
-pca_dict = {'parquetFile at eofs.scala':0, 'collect at eofs.scala':1, 'count at eofs.scala': 2, 'treeAggregate at eofs.scala': 3, 'collect at IndexedRowMatrix.scala': 4,
-             'treeReduce at eofs.scala': 3,
-             }
-pca_dict = {'parquetFile at eofs.scala':0,'zipWithIndex at eofs.scala':0,'first at IndexedRowMatrix.scala':0,'reduce at IndexedRowMatrix.scala':0, 'collect at eofs.scala':0, 'count at eofs.scala': 0, 'treeAggregate at eofs.scala': 1, 'collect at IndexedRowMatrix.scala': 2,
-             'treeReduce at eofs.scala': 1,
-             }
-
-nmf_dict = {'reduce at Utils.scala':1, 'mapPartitionsWithIndex at Utils.scala':1, 	
-'zipWithIndex at read.scala':0}
-
-
-pca_phase_names = ["Parallel HDF5 Read", "Gram Matrix-Vector Product", "A*V Product", "SVD A*V"] #SVD AV is the driver stuff
-nmf_phase_names = ["Parallel HDF5 Read", "Task Overhead Time", "XRAY"] #XRAY is in the driver 
-#nmf_phase_names = ['IO Load Matrix Time','Compute QR','Finalize/Collect']
-
-nmf_kill_stages = [0,1]
-#pca_phase_names = ['IO Load/Center Matrix Time', 'Task Compute Time', 'Finalize/Collect']
-cx_phase_names = ["Parallel Parquet Read", 'Gram Multiply', 'Finalize/Collect', 'SVD']
-#, 'randsvd': pca_dict}
-
-items_not_to_subtract = ['Launch Time', 'Finish Time', 'Getting Result Time',
-                         'Executor Deserialize Time','Executor Run Time' ,"JVM GC Time", 
-                         "Result Serialization Time", 'Task Start Delay', "Time Waiting Until Stage End",
-                         'Time To Finish From Stage Start']
-
-
-
-#items_not_applicable = ['Launch Time', 'Finish Time', 'Total Task Time']
-items_to_subtract = ['Shuffle Write Time', 'Fetch Wait Time' ,"TSQR"]#, 'JVM GC Time']
 
 
 min_or_max_dict = {'min': np.argmin, 'max': np.argmax}
 
-ordered_keys = ['Driver Compute Time','Task Start Delay',"Parallel HDF5 Read", "Parallel Parquet Read", 
-        'Executor Deserialize Time',"Gram Matrix-Vector Product", 'Gram Multiply','Task Compute Time', 'Shuffle Write Time', 'Fetch Wait Time','Result Serialization Time',"A*V Product","Finalize/Collect", "SVD A*V", "SVD","TSQR", "XRAY", 'Scheduler Delay', 'Time Waiting Until Stage End']
-
+def get_stage_names(sc, event_log):
+    stage_names = sc.textFile(event_log).filter(lambda line:"SparkListenerStageComplete" in line).map(lambda x: str(json.loads(x)["Stage Info"]["Stage Name"])).distinct().collect()
+    return stage_names
+    
+    
 #God class
 class ParseLogs(object):
-    def __init__(self, sc, event_log, algo):
+    def __init__(self, sc, event_log, algo, stage_to_phase_name_dict, 
+                 kill_stages=None, accumulables=None, driver_comp_labels=None):
+        
+        self.driver_comp_labels = driver_comp_labels
+        #accumulables = sc.broadcast(accumulables)
+        '''kill stages is list of stage id's we want to ignore'''
         self.algo = algo
-        self.algo_to_phase_dict = sc.broadcast({'cx': cx_phase_names, 'pca': pca_phase_names, 'nmf': nmf_phase_names})
-        self.stage_to_phase_dict = sc.broadcast({'cx': cx_dict, 'pca': pca_dict, 'nmf':nmf_dict})
+        self.stage_to_phase_dict = sc.broadcast(stage_to_phase_name_dict)  #{'cx': cx_dict, 'pca': pca_dict, 'nmf':nmf_dict})
 
         
         loglines = sc.textFile(event_log).filter(lambda line: '"Failed":true' not in line).cache()
@@ -67,19 +38,19 @@ class ParseLogs(object):
         
         self.driver_comp_time, self.driver_comp_dict, self.driver_comp_times = self.calc_driver_comp_time(self.stage_dict.value)
         
-        self.run_time = self.appEnd - self.appStart + self.driver_comp_times[0] + self.driver_comp_times[-1]
+        self.run_time = (self.appEnd - self.appStart + self.driver_comp_times[0] + self.driver_comp_times[-1])
         self.stage_times = self.get_stage_times()
     
         #self.stage_keyed_task_buckets  = self.stage_keyed_task_info.flatMap(flat_map_dict).cache()
         
         
-        self.stage_keyed_task_info, self.stage_and_exec_keyed_task_info = self.calc_stage_keyed_task_info(loglines,self.algo, self.stage_to_phase_dict, self.algo_to_phase_dict, self.appStart, self.stage_dict)
+        self.stage_keyed_task_info, self.stage_and_exec_keyed_task_info = self.calc_stage_keyed_task_info(loglines,self.algo, self.stage_to_phase_dict,self.appStart, self.stage_dict, kill_stages, accumulables)
         
         self.task_counts_dict = sc.broadcast(self.stage_keyed_task_info.map(lambda (i,v): (i,1))\
                                                                       .reduceByKey(add)\
                                                                       .collectAsMap())
-        
-    def calc_stage_keyed_task_info(self, loglines, algo, stage_to_phase_dict, algo_to_phase_dict, appStart, stage_dict):
+        self.run_time /= 1000.
+    def calc_stage_keyed_task_info(self, loglines, algo, stage_to_phase_dict, appStart, stage_dict, kill_stages, accumulables):
         #we do this so we don't pass on the whole class to the executor (only really matters for nonlocal spark)
         stage_and_exec_keyed_task_info = loglines\
                             .filter(lambda x: "SparkListenerTaskEnd" in x)\
@@ -90,15 +61,15 @@ class ParseLogs(object):
                                     int(taskInfo["Task Info"]["Executor ID"])),
                                     taskInfo )
                                 )\
-                .map(lambda (i,v): (i,update_task_dict(v, appStart, stage_dict.value, algo)))\
-                .map(lambda (i,v): (i,create_compute_bucket(i[0],v,algo, stage_dict.value,
-                                                            algo_to_phase_dict.value, stage_to_phase_dict.value))).cache()
+                .map(lambda (i,v): (i,update_task_dict(v, appStart, stage_dict.value, algo, stage_to_phase_dict.value, accumulables))).cache()
+                #.map(lambda (i,v): (i,create_compute_bucket(i[0],v,algo, stage_dict.value,
+                                                        #stage_to_phase_dict.value))).cache()
                 
 
-        if self.algo == 'nmf':
+        if kill_stages:
             stage_and_exec_keyed_task_info = stage_and_exec_keyed_task_info\
-                                                   .filter(lambda (i,v): i[0] not in nmf_kill_stages)
-            self.run_time -= sum([self.stage_times[i] for i in nmf_kill_stages])
+                                                   .filter(lambda (i,v): i[0] not in kill_stages)
+            self.run_time -= sum([self.stage_times[i] for i in kill_stages])
             
             
         '''an rdd of (stage_id, task_info_dictionary) tuples'''
@@ -195,19 +166,18 @@ class ParseLogs(object):
             
         return task_sum_for_mpl
     
-    def add_in_driver_time(self, task_dict):
-        task_dict.update({'Driver Compute Time': self.driver_comp_time - self.driver_comp_times[-1]})
-        if self.algo == 'pca':
-            if "SVD A*V" not in task_dict:
-                task_dict["SVD A*V"] = self.driver_comp_times[-1]
-            else:
-                task_dict["SVD A*V"] += self.driver_comp_times[-1]
-           
-            if "A*V Product" not in task_dict:
-                task_dict["A*V Product"] = self.driver_comp_times[-2]
-            else:
-                task_dict["A*V Product"] += self.driver_comp_times[-2]
-            task_dict['Driver Compute Time'] -= self.driver_comp_times[-2]
+    def add_in_driver_time(self, task_dict, driver_comp_labels=None):
+        '''Move times from Driver Compute Time bucket to user specified name bucket'''
+        task_dict.update({'Driver Compute Time': (self.driver_comp_time / 1000.) })
+        if self.driver_comp_labels is not None:
+            for k,v in self.driver_comp_labels.iteritems():
+                if k not in task_dict:
+                    task_dict[k] = self.driver_comp_times[v] / 1000.
+                else:
+                    task_dict[k] += self.driver_comp_times[v] / 1000.
+                #sub
+                task_dict['Driver Compute Time'] -= self.driver_comp_times[v] / 1000.
+  
         return task_dict
     
     def fold_into_task_overheads(self, summary_dic):
@@ -289,148 +259,4 @@ class ParseLogs(object):
     
 
 
-def update_task_dict(task_info, appStart, stage_dic, algo):
-    '''Parse task dict for time related keys
-    Add Total Task Time, Task Start Delay and Time until stage end to dict'''
-    stage_id = task_info["Stage ID"]
-    stage_info = get_stage_info(stage_dic, stage_id)
-    desired_dict = parse_dict(task_info, algo)
-    desired_dict = add_new_members(task_info, desired_dict, stage_info, algo)
-    run_tests(desired_dict, stage_info)
-    desired_dict = delete_items(desired_dict)
-    return desired_dict
 
-
-def delete_items(desired_dict):
-    del_keys = ["Launch Time", "Finish Time", "JVM GC Time", "Time To Finish From Stage Start", "Getting Result Time"] 
-    for k in del_keys:
-        del desired_dict[k]
-    return desired_dict
-        
-
-def add_new_members(task_info, desired_dict,stage_info, algo):
-    stage_name, stage_start, stage_end = stage_info
-    task_accted_for_time = desired_dict['Executor Run Time'] + desired_dict['Executor Deserialize Time'] + \
-                           desired_dict['Result Serialization Time']  + desired_dict['Getting Result Time']
-    total_task_time = desired_dict['Finish Time'] - desired_dict['Launch Time']
-    
-
-    if algo == "nmf":
-        if "TSQR" not in desired_dict:
-            desired_dict["TSQR"] = 0.0
-        if desired_dict["TSQR"] > desired_dict["Executor Run Time"]:
-            assert False, "%s" % (desired_dict)
-    desired_dict['Scheduler Delay'] = total_task_time - task_accted_for_time
-    desired_dict['Time To Finish From Stage Start'] = desired_dict['Finish Time'] - stage_start
-    desired_dict['Task Start Delay'] = desired_dict['Launch Time'] - stage_start
-    
-#     if stage_end < desired_dict['Finish Time']:
-     
-#             print "Stage end is %d task finish time is %d" % (stage_end, desired_dict['Finish Time'])
-#             print task_info["Stage ID"], task_info["Task Info"]["Speculative"]
-        
-    desired_dict['Time Waiting Until Stage End'] = stage_end - desired_dict['Finish Time']
-    
-    return desired_dict
-    
-def run_tests(desired_dict, stage_info):
-    #assert False
-    stage_name, stage_start, stage_end = stage_info
-    total_task_time = desired_dict['Finish Time'] - desired_dict['Launch Time']
-    assert desired_dict['Task Start Delay'] +  total_task_time == desired_dict['Time To Finish From Stage Start']
-    assert desired_dict['Time To Finish From Stage Start'] + desired_dict['Time Waiting Until Stage End'] == stage_end -    stage_start
-    sum_ = 0
-    for k in ['Executor Run Time',
-              'Getting Result Time',
-              'Driver Compute Time',
-              'Task Start Delay',
-              'Result Serialization Time',
-              'Scheduler Delay',
-              'Executor Deserialize Time']:
-
-        if k in desired_dict:
-            sum_ += desired_dict[k]
-        
-    assert sum_ == desired_dict['Time To Finish From Stage Start']
-#     for k, v in desired_dict.iteritems():
-#         assert v >= 0, "Oh no key %s is %d" % (k,v)
-
-def run_task_tests(pd,maxes_for_mpl):
-    maxes_sum = sum([maxes_for_mpl[k] for k in ordered_keys  if k in maxes_for_mpl and k!= 'Driver Compute Time' and  k!= 'Time Waiting Until Stage End'])
-    maxes_sum - maxes_for_mpl['Time To Finish From Stage Start']
-    assert np.abs(maxes_sum - maxes_for_mpl['Time To Finish From Stage Start']) < 0.1
-    total_app_time = maxes_for_mpl['Time To Finish From Stage Start'] + maxes_for_mpl['Driver Compute Time'] + maxes_for_mpl['Time Waiting Until Stage End'] 
-    assert total_app_time ==  pd.appEnd - pd.appStart
-    
-def get_stage_info(stage_dic, stage_id):
-    stage_name = stage_dic[stage_id]['name']
-    stage_start = stage_dic[stage_id]['stage_submit_time']
-    stage_end =  stage_dic[stage_id]['stage_complete_time']
-    return stage_name, stage_start, stage_end
-    
-def parse_dict(task_info, algo):
-    '''get all time related k,value pairs in the task dict from the json event logs
-    this is recurtsive b/c we parse dicts inside dicts'''
-    desired_dict={}
-
-        
-    for key,value in task_info.iteritems():
-        if "Time" in str(key):
-            #print str(key)
-            #if "Launch Time" in key or "Finish Time" in key:
-                #value = value - appStart
-            #convert nanoseconds to milliseconds
-            if "Shuffle Write Time" in key:
-                value /= 1000000.0
-            desired_dict[str(key)] = value
-        if key == "Accumulables":
-            if algo == "nmf" and len(value) > 1:
-                for d in value:
-                    if d['Name'] == "Time taken for Local QR":
-                        desired_dict['TSQR'] = float(d['Update'])
-        if isinstance(value,dict):
-            d = parse_dict(value, algo)
-            desired_dict.update(d)
-
-                
-
-   
-
-
-    return desired_dict
-
-def flat_map_dict(key_plus_dic):
-    '''returns a list of nested tuples, where each tuple is 
-    ((key[0], key[1],...key[n], dic_key[i]), value[i])'''
-    key, dic = key_plus_dic
-    key = [key] if not isinstance(key, tuple) or not isinstance(key,list) else list(key)
-    return [(tuple(key + [dic_key]),v) for dic_key,v in dic.iteritems()]
-
-def create_compute_bucket(stage_id,dic, algo, stage_dict, algo_to_phase_dict, stage_to_phase_dict):
-    
-    stage_name = str(stage_dict[stage_id]['name']) #.split(':')[0]
-    if algo == 'cx':
-        compute_bucket_id = stage_to_phase_dict[algo][stage_name]
-    elif algo == 'pca':
-        compute_bucket_id = stage_to_phase_dict[algo][stage_name.split(':')[0]]
-    elif algo == 'nmf':
-        compute_bucket_id = stage_to_phase_dict[algo][stage_name.split(':')[0]]
-        
-    if stage_name.split(':')[0] == "mapPartitionsWithIndex at Utils.scala":
-        if stage_id == 2:
-            compute_bucket_name = "Parallel HDF5 Read"
-        else:
-            compute_bucket_name = "Task Overhead Time"
-    else:
-        compute_bucket_name = algo_to_phase_dict[algo][compute_bucket_id]
-    
-
-    dic[compute_bucket_name] = dic['Executor Run Time']
-    del dic['Executor Run Time']
-    for k in dic.keys():
-        if k in items_to_subtract: #and k != compute_bucket_name :
-            try:
-                dic[compute_bucket_name] -= dic[k]
-            except:
-                print  "%s %s" % (k, str(dic[k]))
-    return dic
