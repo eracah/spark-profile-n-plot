@@ -3,6 +3,7 @@
 ## Using the Notebook:
 * Pull down this repo to somewhere on your home directory (on Cori or Edison, etc.)
 * Set up a Spark iPython profile on your home direcotry for yourself (I already did that for you, Alex)
+* Add "module load python" to your .bashrc.ext file in your home directory
 * Copy start_notebook_from_local.sh to your local mac machine
 * From your local machine:
 	* ./start_notebook_from_local.sh --profile=pyspark_local
